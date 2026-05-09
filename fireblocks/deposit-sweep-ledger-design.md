@@ -124,13 +124,23 @@ CREATE TABLE fireblocks_webhook_events (
   resource_id VARCHAR(128) NULL,
   workspace_id VARCHAR(128) NULL,
   created_at_ms BIGINT NULL,
+  raw_body_hash CHAR(64) NOT NULL,
+  fireblocks_signature TEXT NULL,
+  fireblocks_signature_verified TINYINT NOT NULL DEFAULT 0,
+  verified_at TIMESTAMP NULL,
   payload JSON NOT NULL,
+  canonical_payload_hash CHAR(64) NOT NULL,
+  previous_event_hash CHAR(64) NULL,
+  event_hash CHAR(64) NOT NULL,
+  kms_key_id VARCHAR(256) NOT NULL,
+  event_mac VARBINARY(512) NOT NULL,
   processed TINYINT NOT NULL DEFAULT 0,
   process_attempts INT NOT NULL DEFAULT 0,
   last_error TEXT NULL,
   received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   processed_at TIMESTAMP NULL,
   UNIQUE KEY uk_event_id (event_id),
+  UNIQUE KEY uk_event_hash (event_hash),
   KEY idx_resource_type (resource_id, event_type),
   KEY idx_processed (processed, received_at)
 );
@@ -141,6 +151,55 @@ CREATE TABLE fireblocks_webhook_events (
 - `event_id` 使用 Fireblocks webhook notification 的 `id`。
 - 重复事件直接忽略或更新 `received_at`，不得重复执行业务逻辑。
 - 保留完整 `payload`，便于审计、补偿、重放。
+- `raw_body_hash` 使用 Fireblocks webhook 原始 body 计算，不能使用解析后再序列化的 JSON。
+- `fireblocks_signature_verified = 1` 表示事件已经通过 Fireblocks webhook 签名/JWKS 校验。
+- `event_mac` 是内部 KMS MAC，用于证明事件进入本系统后未被数据库或内部服务静默篡改。
+
+### Webhook 事件封存
+
+Webhook 事件有两层信任：
+
+1. Fireblocks webhook 签名证明事件来自 Fireblocks。
+2. 内部 KMS MAC 证明事件落库后没有被篡改。
+
+计算方式：
+
+```text
+raw_body_hash = sha256(raw_http_body)
+canonical_payload_hash = sha256(canonical_json(parsed_payload))
+
+event_hash = sha256(
+  event_id
+  + event_type
+  + resource_id
+  + created_at_ms
+  + raw_body_hash
+  + canonical_payload_hash
+  + fireblocks_signature
+  + fireblocks_signature_verified
+  + previous_event_hash
+)
+
+event_mac = KMS GenerateMac(event_hash)
+```
+
+处理链路：
+
+```text
+Webhook Ingress
+  -> verify Fireblocks-Webhook-Signature
+  -> insert fireblocks_webhook_events
+  -> KMS GenerateMac(event_hash)
+  -> enqueue event_id
+
+Deposit/Risk Worker
+  -> load fireblocks_webhook_events
+  -> recompute event_hash
+  -> KMS VerifyMac(event_hash, event_mac)
+  -> only then process event
+```
+
+如果 `VerifyMac` 失败，必须停止处理该事件，标记 `WEBHOOK_EVENT_TAMPERED` 并告警。
 
 ## 入账表
 
@@ -191,13 +250,41 @@ chain + ":" + txHash + ":" + assetId + ":" + destinationVaultAccountId + ":" + c
 
 ## Vault asset 余额水位表
 
-`vault_account.asset.balance_updated` 是 vault asset 维度的余额水位事件。建议维护独立水位表，用于判断 Fireblocks 余额视图已经同步到哪个链上区块，并为余额 delta 聚合校验提供基准。
+`vault_account.asset.balance_updated` 是 vault asset 维度的余额水位事件。建议维护 append-only snapshot 表作为事实源，再维护 watermark 表作为当前水位索引。业务和风控都读取同一份 snapshot，避免各自重复查询 Fireblocks 并看到不同时间点的余额。
+
+```sql
+CREATE TABLE vault_asset_balance_snapshots (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  vault_account_id VARCHAR(64) NOT NULL,
+  asset_id VARCHAR(64) NOT NULL,
+  block_height BIGINT NOT NULL,
+  block_hash VARCHAR(128) NULL,
+  total_balance DECIMAL(38, 18) NOT NULL,
+  available_balance DECIMAL(38, 18) NOT NULL,
+  source_event_id VARCHAR(128) NULL,
+  raw_balance_event JSON NULL,
+  raw_vault_asset JSON NOT NULL,
+  canonical_payload_hash CHAR(64) NOT NULL,
+  previous_snapshot_hash CHAR(64) NULL,
+  snapshot_hash CHAR(64) NOT NULL,
+  kms_key_id VARCHAR(256) NOT NULL,
+  snapshot_mac VARBINARY(512) NOT NULL,
+  created_by VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_vault_asset_block (vault_account_id, asset_id, block_height, block_hash),
+  UNIQUE KEY uk_snapshot_hash (snapshot_hash),
+  KEY idx_vault_asset_time (vault_account_id, asset_id, created_at)
+);
+```
+
+`vault_asset_balance_snapshots` 只允许 insert，不允许 update/delete。它是余额事实源。
 
 ```sql
 CREATE TABLE vault_asset_balance_watermarks (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   vault_account_id VARCHAR(64) NOT NULL,
   asset_id VARCHAR(64) NOT NULL,
+  last_snapshot_id BIGINT NOT NULL,
   last_block_height BIGINT NOT NULL,
   last_block_hash VARCHAR(128) NULL,
   last_total_balance DECIMAL(38, 18) NULL,
@@ -211,10 +298,100 @@ CREATE TABLE vault_asset_balance_watermarks (
 
 说明：
 
+- `vault_asset_balance_snapshots` 保存每次 balance update 后主动 `GET /vault/accounts/{vaultAccountId}/{assetId}` 得到的余额快照。
+- `vault_asset_balance_watermarks` 只保存当前最新 snapshot 的索引，便于快速查询。
 - `last_block_height` 表示该 vault asset 在 Fireblocks 余额视图中已经同步到的最高区块高度。
 - `last_block_hash` 用于在同高度场景下校验链上区块是否一致。
 - `last_total_balance` 和 `last_available_balance` 用于聚合余额 delta 校验，不建议作为单笔入账的唯一依据。
 - 如果首次收到 balance update 时没有历史水位，可以先初始化水位，并通过交易状态和区块水位确认后续 deposit。
+
+### Balance snapshot 封存
+
+Snapshot 防篡改使用哈希链和 KMS MAC：
+
+```text
+canonical_payload_hash = sha256(canonical_json(raw_balance_event + raw_vault_asset))
+
+snapshot_hash = sha256(
+  vault_account_id
+  + asset_id
+  + block_height
+  + block_hash
+  + total_balance
+  + available_balance
+  + canonical_payload_hash
+  + previous_snapshot_hash
+)
+
+snapshot_mac = KMS GenerateMac(snapshot_hash)
+```
+
+校验时：
+
+```text
+KMS VerifyMac(snapshot_hash, snapshot_mac)
+```
+
+数据库攻击者即使能改 MySQL，也不能在没有 KMS `GenerateMac` 权限的情况下伪造合法 snapshot。风控任务应定期校验 snapshot 哈希链和 KMS MAC；发现失败时标记 `SNAPSHOT_TAMPERED`，暂停该 vault asset 的入账释放或归集，并报警。
+
+### KMS MAC 权限隔离
+
+KMS MAC key 建议按环境隔离，例如：
+
+```text
+alias/fireblocks/{env}/webhook-event-mac
+alias/fireblocks/{env}/balance-snapshot-mac
+```
+
+角色权限：
+
+```text
+Webhook Ingress / Event Sealer
+  kms:GenerateMac on webhook-event-mac
+  不允许 kms:VerifyMac 以外的 KMS 管理操作
+
+Balance Snapshot Worker
+  kms:VerifyMac on webhook-event-mac
+  kms:GenerateMac on balance-snapshot-mac
+
+Deposit Worker
+  kms:VerifyMac on webhook-event-mac
+  kms:VerifyMac on balance-snapshot-mac
+  不允许 kms:GenerateMac
+
+Risk Worker
+  kms:VerifyMac on webhook-event-mac
+  kms:VerifyMac on balance-snapshot-mac
+  不允许 kms:GenerateMac
+
+Business Services
+  不允许直接读写 webhook/snapshot 事实表
+  不允许 kms:GenerateMac
+```
+
+MySQL 权限：
+
+```text
+fireblocks_webhook_events
+  Webhook Ingress: INSERT
+  Workers: SELECT, UPDATE processed/process_attempts/last_error only
+  不允许业务服务 UPDATE payload/hash/mac 字段
+
+vault_asset_balance_snapshots
+  Balance Snapshot Worker: INSERT
+  Deposit/Risk Worker: SELECT
+  所有运行时服务都不允许 UPDATE/DELETE
+
+vault_asset_balance_watermarks
+  Balance Snapshot Worker: INSERT/UPDATE
+  Deposit/Risk Worker: SELECT
+```
+
+外部审计：
+
+- 每条 webhook event 的 `event_hash`、`event_mac`、`event_id` 写入不可变审计存储，例如 S3 Object Lock 或 append-only audit topic。
+- 每条 balance snapshot 的 `snapshot_hash`、`snapshot_mac`、`vaultAccountId`、`assetId`、`blockHeight` 写入不可变审计存储。
+- 定时任务重新计算哈希链并调用 KMS `VerifyMac`，发现断链或 MAC 失败即触发 `TAMPER_ALERT`。
 
 ## 记账事件表
 
@@ -342,7 +519,25 @@ handleWebhook(rawBody, headers):
   verify Fireblocks-Webhook-Signature with JWKS
   parse payload
 
-  insert fireblocks_webhook_events(event_id, event_type, resource_id, payload)
+  rawBodyHash = sha256(rawBody)
+  canonicalPayloadHash = sha256(canonical_json(payload))
+  eventHash = sha256(event identity + rawBodyHash + canonicalPayloadHash + previousEventHash)
+  eventMac = KMS GenerateMac(eventHash)
+
+  insert fireblocks_webhook_events(
+    event_id,
+    event_type,
+    resource_id,
+    raw_body_hash,
+    fireblocks_signature,
+    fireblocks_signature_verified,
+    canonical_payload_hash,
+    previous_event_hash,
+    event_hash,
+    kms_key_id,
+    event_mac,
+    payload
+  )
     on duplicate key ignore
 
   if inserted:
@@ -356,6 +551,8 @@ handleWebhook(rawBody, headers):
 - 必须使用 raw body 验签，不能用已 JSON 解析再序列化后的 body。
 - JWKS 按 Fireblocks 文档缓存，按环境选择 US/EU/EU2/Sandbox 的 key endpoint。
 - 返回 2xx 前不调用 Fireblocks API，不做归集，不写用户余额。
+- 只有通过 Fireblocks 验签的事件才能生成 KMS MAC 并进入业务队列。
+- 所有 worker 处理事件前必须重新计算 `event_hash` 并执行 KMS `VerifyMac`。
 
 ## 处理入账交易事件
 
@@ -363,6 +560,7 @@ handleWebhook(rawBody, headers):
 
 ```text
 handleTransactionStatusUpdated(event):
+  verifyWebhookEventMac(event)
   tx = event.data
 
   if tx.operation != TRANSFER:
@@ -405,17 +603,20 @@ handleTransactionStatusUpdated(event):
 
 ## 处理余额更新事件
 
-处理 `vault_account.asset.balance_updated`：
+处理 `vault_account.asset.balance_updated` 分两步：先生成可信 balance snapshot，再基于 snapshot 释放待确认 deposit。
+
+Balance Snapshot Worker：
 
 ```text
 handleVaultAssetBalanceUpdated(event):
+  verifyWebhookEventMac(event)
+
   balance = event.data
   vaultAccountId = balance.vaultAccountId
   assetId = balance.assetId
   balanceBlockHeight = balance.blockHeight
   balanceBlockHash = balance.blockHash
 
-  oldWatermark = load vault_asset_balance_watermarks for update
   vaultAsset = GET /vault/accounts/{vaultAccountId}/{assetId}
 
   if vaultAsset.blockHeight < balanceBlockHeight:
@@ -430,13 +631,48 @@ handleVaultAssetBalanceUpdated(event):
     alert
     return
 
+  oldSnapshot = load latest vault_asset_balance_snapshots
+  snapshotHash = buildSnapshotHash(vaultAsset, event, oldSnapshot.snapshot_hash)
+  snapshotMac = KMS GenerateMac(snapshotHash)
+
+  insert vault_asset_balance_snapshots
+    with raw_balance_event = event.payload,
+         raw_vault_asset = vaultAsset,
+         previous_snapshot_hash = oldSnapshot.snapshot_hash,
+         snapshot_hash = snapshotHash,
+         snapshot_mac = snapshotMac
+
+  update vault_asset_balance_watermarks
+    set last_snapshot_id = snapshot.id,
+        last_block_height = vaultAsset.blockHeight,
+        last_block_hash = vaultAsset.blockHash,
+        last_total_balance = vaultAsset.total,
+        last_available_balance = vaultAsset.available,
+        last_balance_event_id = event.id
+
+  enqueue BalanceSnapshotReady(snapshot.id)
+```
+
+Deposit Reconciliation Worker：
+
+```text
+handleBalanceSnapshotReady(snapshotId):
+  snapshot = load vault_asset_balance_snapshots
+  verifySnapshotMac(snapshot)
+
+  vaultAccountId = snapshot.vault_account_id
+  assetId = snapshot.asset_id
+  balanceBlockHeight = snapshot.block_height
+  balanceBlockHash = snapshot.block_hash
+  oldWatermark = load previous snapshot/watermark for aggregate check
+
   deposits = find deposits
     where destination_vault_account_id = vaultAccountId
       and asset_id = assetId
       and status = TX_COMPLETED_WAIT_BALANCE
       and block_height <= balanceBlockHeight
 
-  run aggregateBalanceDeltaCheck(oldWatermark, vaultAsset, deposits)
+  run aggregateBalanceDeltaCheck(oldWatermark, snapshot, deposits)
 
   for each deposit:
     if deposit.block_hash is not null
@@ -447,7 +683,7 @@ handleVaultAssetBalanceUpdated(event):
       alert
       continue
 
-    if vaultAsset.blockHeight < deposit.block_height:
+    if snapshot.block_height < deposit.block_height:
       continue
 
     if both block hashes exist and mismatch:
@@ -455,14 +691,7 @@ handleVaultAssetBalanceUpdated(event):
       alert
       continue
 
-    confirmDepositAndCreateSweep(deposit, event, vaultAsset)
-
-  update vault_asset_balance_watermarks
-    set last_block_height = vaultAsset.blockHeight,
-        last_block_hash = vaultAsset.blockHash,
-        last_total_balance = vaultAsset.total,
-        last_available_balance = vaultAsset.available,
-        last_balance_event_id = event.id
+    confirmDepositAndCreateSweep(deposit, snapshot)
 ```
 
 ### Balance update 校验规则
@@ -509,9 +738,9 @@ newBalance - oldBalance == deposit.amount
 
 ```text
 oldHeight = oldWatermark.last_block_height
-newHeight = vaultAsset.blockHeight
+newHeight = snapshot.block_height
 oldBalance = oldWatermark.last_total_balance
-newBalance = vaultAsset.total
+newBalance = snapshot.total_balance
 
 incomingSum =
   sum(deposits.amount)
