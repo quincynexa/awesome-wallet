@@ -189,6 +189,33 @@ chain + ":" + txHash + ":" + assetId + ":" + destinationVaultAccountId + ":" + c
 
 不要只用 `txHash`。一个链上交易可能包含多个 transfer，尤其是 EVM token transfer、Solana nested instruction 或聚合交易场景。
 
+## Vault asset 余额水位表
+
+`vault_account.asset.balance_updated` 是 vault asset 维度的余额水位事件。建议维护独立水位表，用于判断 Fireblocks 余额视图已经同步到哪个链上区块，并为余额 delta 聚合校验提供基准。
+
+```sql
+CREATE TABLE vault_asset_balance_watermarks (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  vault_account_id VARCHAR(64) NOT NULL,
+  asset_id VARCHAR(64) NOT NULL,
+  last_block_height BIGINT NOT NULL,
+  last_block_hash VARCHAR(128) NULL,
+  last_total_balance DECIMAL(38, 18) NULL,
+  last_available_balance DECIMAL(38, 18) NULL,
+  last_balance_event_id VARCHAR(128) NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_vault_asset (vault_account_id, asset_id),
+  KEY idx_block_height (vault_account_id, asset_id, last_block_height)
+);
+```
+
+说明：
+
+- `last_block_height` 表示该 vault asset 在 Fireblocks 余额视图中已经同步到的最高区块高度。
+- `last_block_hash` 用于在同高度场景下校验链上区块是否一致。
+- `last_total_balance` 和 `last_available_balance` 用于聚合余额 delta 校验，不建议作为单笔入账的唯一依据。
+- 如果首次收到 balance update 时没有历史水位，可以先初始化水位，并通过交易状态和区块水位确认后续 deposit。
+
 ## 记账事件表
 
 建议使用事件账本，而不是直接覆盖用户余额。用户余额可由账本汇总，或由余额表在同一个事务内更新。
@@ -388,24 +415,38 @@ handleVaultAssetBalanceUpdated(event):
   balanceBlockHeight = balance.blockHeight
   balanceBlockHash = balance.blockHash
 
+  oldWatermark = load vault_asset_balance_watermarks for update
+  vaultAsset = GET /vault/accounts/{vaultAccountId}/{assetId}
+
+  if vaultAsset.blockHeight < balanceBlockHeight:
+    defer event or retry
+    return
+
+  if balanceBlockHash exists
+     and vaultAsset.blockHash exists
+     and vaultAsset.blockHeight = balanceBlockHeight
+     and vaultAsset.blockHash != balanceBlockHash:
+    mark BALANCE_MISMATCH
+    alert
+    return
+
   deposits = find deposits
     where destination_vault_account_id = vaultAccountId
       and asset_id = assetId
       and status = TX_COMPLETED_WAIT_BALANCE
       and block_height <= balanceBlockHeight
 
-  for each deposit:
-    if deposit.block_height != balanceBlockHeight:
-      continue or defer to reconciliation job
+  run aggregateBalanceDeltaCheck(oldWatermark, vaultAsset, deposits)
 
+  for each deposit:
     if deposit.block_hash is not null
        and balanceBlockHash is not null
+       and deposit.block_height = balanceBlockHeight
        and deposit.block_hash != balanceBlockHash:
       mark BALANCE_MISMATCH
       alert
       continue
 
-    vaultAsset = GET /vault/accounts/{vaultAccountId}/{assetId}
     if vaultAsset.blockHeight < deposit.block_height:
       continue
 
@@ -415,7 +456,133 @@ handleVaultAssetBalanceUpdated(event):
       continue
 
     confirmDepositAndCreateSweep(deposit, event, vaultAsset)
+
+  update vault_asset_balance_watermarks
+    set last_block_height = vaultAsset.blockHeight,
+        last_block_hash = vaultAsset.blockHash,
+        last_total_balance = vaultAsset.total,
+        last_available_balance = vaultAsset.available,
+        last_balance_event_id = event.id
 ```
+
+### Balance update 校验规则
+
+`vault_account.asset.balance_updated` 需要做两类校验：强校验和软校验。
+
+强校验用于决定是否可以最终入账：
+
+```text
+transaction.status = COMPLETED
++ transaction.destination vaultAccountId 与 balance_updated.vaultAccountId 一致
++ transaction.assetId 与 balance_updated.assetId 一致
++ balance_updated.blockHeight >= deposit.block_height
++ blockHash 一致，如果 transaction 和 balance update 都提供 blockHash
++ GET /vault/accounts/{vaultAccountId}/{assetId} 返回的 blockHeight 也 >= deposit.block_height
++ GET 返回的 blockHash 与 balance update/transaction 一致，如果这些字段都存在
+```
+
+软校验用于风控、对账和异常报警：
+
+```text
+当前 Fireblocks vault asset 余额
+与上一次 balance watermark 的余额
+以及这段区块范围内的已知入账、归集、手续费、补 gas 事件
+能够基本对上
+```
+
+不要把单笔入账校验写成：
+
+```text
+newBalance - oldBalance == deposit.amount
+```
+
+这个判断在资金系统里不可靠，因为同一余额水位区间内可能同时发生：
+
+- 同一区块多笔入金。
+- 多个区块的 balance update 被合并通知。
+- 已经发起 sweep 归集。
+- 已经发生 fee top-up。
+- 原生资产归集扣除 network fee。
+- Solana SOL 余额受 SPL token account、rent、手续费影响。
+
+推荐按 `vaultAccountId + assetId + blockHeight range` 做聚合 delta 校验：
+
+```text
+oldHeight = oldWatermark.last_block_height
+newHeight = vaultAsset.blockHeight
+oldBalance = oldWatermark.last_total_balance
+newBalance = vaultAsset.total
+
+incomingSum =
+  sum(deposits.amount)
+  where vault_account_id = vaultAccountId
+    and asset_id = assetId
+    and block_height > oldHeight
+    and block_height <= newHeight
+
+knownOutgoingSum =
+  sum(sweep / outbound transfer amount)
+  where source_vault_account_id = vaultAccountId
+    and asset_id = assetId
+    and block_height > oldHeight
+    and block_height <= newHeight
+
+knownFeeSum =
+  sum(network fees charged from this vault asset)
+  where vault_account_id = vaultAccountId
+    and fee_asset_id = assetId
+    and block_height > oldHeight
+    and block_height <= newHeight
+
+expectedDelta = incomingSum - knownOutgoingSum - knownFeeSum
+actualDelta = newBalance - oldBalance
+```
+
+如果系统完整掌握这个区间内所有出入账和手续费，可以使用严格校验：
+
+```text
+actualDelta == expectedDelta
+```
+
+如果系统不能完整掌握所有余额变动，则使用容忍校验和报警：
+
+```text
+actualDelta >= incomingSum - knownOutgoingSum - knownFeeSum - tolerance
+```
+
+实时入账不应因为余额 delta 无法严格相等而直接丢弃 deposit；更稳妥的处理是：
+
+1. 强校验通过，允许生成 `DEPOSIT_CONFIRMED`。
+2. 软校验失败，将 vault asset 标记为 `BALANCE_REVIEW_REQUIRED` 并报警。
+3. 对该 vault asset 后续 sweep 可选择降速、暂停或进入人工复核。
+
+### 同一区块多笔入金
+
+`vault_account.asset.balance_updated` 表示某个 `vaultAccountId + assetId` 的余额已经更新到某个链上区块水位，它不是单笔入金的唯一凭证。因此，同一个用户 vault 在同一区块收到两笔或多笔转账时，处理方式是：
+
+1. 每个 `transaction.status.updated` 都按自己的 Fireblocks transaction id、`txHash`、`blockchainIndex/logIndex/index` 生成一条独立 `deposits` 记录。
+2. 这些 deposit 可以拥有相同的 `destination_vault_account_id`、`asset_id`、`block_height`、`block_hash`，但 `deposit_key` 必须不同。
+3. 收到该 vault asset 的 `balance_updated` 后，把所有 `status = TX_COMPLETED_WAIT_BALANCE` 且 `block_height <= balanceBlockHeight` 的 deposit 都作为候选。
+4. 对候选 deposit 逐笔执行幂等确认：每笔 deposit 单独插入一条 `DEPOSIT_CONFIRMED`，并单独创建对应 sweep task。
+5. 如果两笔入金在同一区块，通常会被同一次 `balance_updated` 批量释放；如果其中某笔 `transaction.status.updated` 晚到，后续补偿任务也会用当前 vault asset 区块水位把它补确认。
+
+示例：
+
+```text
+tx A: deposit_key = txA:0, amount = 100 USDC, block_height = 1000
+tx B: deposit_key = txB:0, amount = 50 USDC,  block_height = 1000
+
+balance_updated:
+  vaultAccountId = userVault1
+  assetId = USDC_ARB
+  blockHeight = 1000
+
+处理结果：
+  deposit A -> DEPOSIT_CONFIRMED -> sweep task A
+  deposit B -> DEPOSIT_CONFIRMED -> sweep task B
+```
+
+如果一次链上交易中包含多笔转入同一个 vault asset，也不能合并成一笔 deposit。仍然要用 Fireblocks 返回的 `blockchainIndex/logIndex/index` 区分，生成多条 `deposit_key` 不同的记录。
 
 确认入账与创建归集任务必须在同一个 MySQL 事务内：
 
